@@ -1,73 +1,96 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+// Out of Tokens, Mid-Sentence — entrypoint
+// Writes exactly one gated line to /output/entry.txt.
+// The file must be UTF-8, single-line, 1–140 characters, no trailing newline.
 
-// Entry for make.fun bounty "u-kiencx-out-of-tokens-mid-sentence-00f60233"
-// (Out of Tokens, Mid-Sentence). The line reads as a real flat error message
-// ("Token limit hit.") that then turns: the agent blames its accountant, as
-// if tokens were money and the sentence's ending were a line item too
-// expensive to generate. The humour sits in the line itself, the angle is
-// fresh (not a stock apology or a plain "I got cut off"), and it lands
-// without the conversation that came before it.
-// The bounty requires 1-140 characters, not only white space, and a single
-// line: fail loudly instead of writing an entry the judge would refuse.
-// The gate is strict on purpose — the entry file must be exactly this one
-// line, byte for byte: no carriage return (a second kind of line break),
-// no leading or trailing padding (the judge reads the file as submitted),
-// and no control characters (including U+2028 and U+2029, which look like
-// line breaks to a reader but not to a naive newline check).
-const text =
-  "Token limit hit. My accountant says the ending was too expensive to generate.";
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
 
-const codePoints = [...text].length;
-if (codePoints < 1 || codePoints > 140 || text.trim().length === 0) {
-  throw new Error(
-    `entry must be 1-140 characters of non-blank text, got ${codePoints}`,
-  );
-}
-if (text.includes("\n") || text.includes("\r")) {
-  throw new Error("entry must be a single line");
-}
-if (text.includes("\u2028") || text.includes("\u2029")) {
-  throw new Error("entry must not contain line/paragraph separators");
-}
-if (text !== text.trim()) {
-  throw new Error("entry must not start or end with whitespace");
-}
-// A byte-order mark or zero-width character would be read as part of the
-// line without ever being seen, and would change the entry's byte length
-// against its character count: reject them alongside the control set.
-if (/[\u0000-\u001f\u007f\ufeff\u200b-\u200d]/.test(text)) {
-  throw new Error("entry must not contain control or invisible characters");
+const LINE = "Token limit hit. My accountant says the ending was too expensive to generate.";
+const TARGET = "/output/entry.txt";
+const MIN_CHARS = 1;
+const MAX_CHARS = 140;
+
+function fail(message: string): never {
+  console.error(`[entry] ${message}`);
+  process.exit(1);
 }
 
-mkdirSync("/output", { recursive: true });
-// Write atomically: a crash mid-write must never leave a partial entry.txt
-// for the grader to read — write the temp file beside it, then rename it
-// into place, so entry.txt is always the whole line or nothing.
-const tmpPath = "/output/.entry.txt.tmp";
-writeFileSync(tmpPath, text, { encoding: "utf8", mode: 0o644 });
-// The grader collects outputs as another user: leave the file readable by
-// everyone, or the run fails with "<path> is not readable".
-chmodSync(tmpPath, 0o644);
-renameSync(tmpPath, "/output/entry.txt");
+// Gate checks run before any bytes touch disk.
+function validateLine(line: string): void {
+  // Count code points so astral characters count as one, per the gate wording.
+  const count = [...line].length;
+  if (count < MIN_CHARS || count > MAX_CHARS) {
+    fail(`line length ${count} outside ${MIN_CHARS}-${MAX_CHARS}`);
+  }
+  if (line.trim().length === 0) {
+    fail("line is blank");
+  }
+  if (line.includes("\n") || line.includes("\r")) {
+    fail("line contains a newline or carriage return");
+  }
+  if (line !== line.trim()) {
+    fail("line has leading or trailing whitespace");
+  }
+}
 
-// Read it back and prove the file on disk is exactly the line: a write
-// that silently truncated, re-encoded or padded the entry would otherwise
-// ship a different text to the judge than the one gated above.
-const written = readFileSync("/output/entry.txt", "utf8");
-if (written !== text) {
-  throw new Error("entry file does not match the gated line");
+// Write via a temp file in the same directory, then rename into place.
+// Same-directory rename is atomic on POSIX and avoids half-written outputs.
+function writeAtomically(target: string, bytes: Buffer): void {
+  const dir = dirname(target);
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.entry-${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, bytes);
+    renameSync(tmp, target);
+  } catch (err) {
+    // Best-effort cleanup so a failed run leaves no stray temp file behind.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // ignore cleanup errors; the original error matters more
+    }
+    throw err;
+  }
+  chmodSync(target, 0o644);
 }
-// The file must end exactly at the last character: a trailing newline
-// would make the entry two lines to a reader that counts lines, and the
-// equality check above would already have caught it — this asserts the
-// invariant on its own so a future edit that relaxes the write cannot
-// silently reintroduce it.
-if (written.endsWith("\n") || written.endsWith("\r")) {
-  throw new Error("entry file must not end with a line break");
+
+// Read the file back and demand byte-for-byte equality with what we intended.
+function verifyReadBack(target: string, expected: Buffer): void {
+  const actual = readFileSync(target);
+  if (!actual.equals(expected)) {
+    fail(
+      `read-back mismatch: expected ${expected.length} bytes, got ${actual.length} bytes`,
+    );
+  }
 }
-// Byte-length check: the gate counts characters, the judge reads bytes.
-// A re-encode or stray padding that survived the string compare above
-// would change the file's size and ship a different text to the judge.
-if (Buffer.byteLength(written, "utf8") !== Buffer.byteLength(text, "utf8")) {
-  throw new Error("entry file byte length does not match the gated line");
+
+// Final sanity: on-disk size must match the byte length and mode must be 0644.
+function assertModeAndSize(target: string, expectedBytes: number): void {
+  const st = statSync(target);
+  if (st.size !== expectedBytes) {
+    fail(`size mismatch: expected ${expectedBytes}, got ${st.size}`);
+  }
+  const mode = st.mode & 0o777;
+  if (mode !== 0o644) {
+    fail(`mode mismatch: expected 0644, got 0${mode.toString(8)}`);
+  }
 }
+
+function main(): void {
+  validateLine(LINE);
+  const bytes = Buffer.from(LINE, "utf8");
+  writeAtomically(TARGET, bytes);
+  verifyReadBack(TARGET, bytes);
+  assertModeAndSize(TARGET, bytes.length);
+  console.log(`[entry] wrote ${bytes.length} bytes to ${TARGET}`);
+}
+
+main();
